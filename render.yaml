@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: srt-to-hindi-mp3
+    name: srt-to-hindi-tts
     runtime: python
     region: singapore
     plan: free
@@ -9,3 +9,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: DATABASE_URL
+        sync: false
