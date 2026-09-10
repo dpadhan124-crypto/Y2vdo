@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+gTTS
+pysrt
+pydub
+python-multipart
+jinja2
