@@ -5,3 +5,4 @@ edge-tts
 pydub
 SQLAlchemy
 psycopg2-binary
+python-multipart
