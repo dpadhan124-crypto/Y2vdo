@@ -1,6 +1,5 @@
 import os
 import uuid
-import time
 import asyncio
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse, FileResponse
@@ -38,7 +37,7 @@ class SubtitleLine(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Precise Timestamp SRT to Hindi TTS Dashboard")
+app = FastAPI(title="Precise Timestamp SRT to Hindi Neural TTS")
 
 def srt_time_to_ms(t):
     return (t.hours * 3600 + t.minutes * 60 + t.seconds) * 1000 + t.milliseconds
@@ -79,7 +78,7 @@ async def process_srt_in_background(task_id: str, input_path: str, voice: str):
             db.add(db_line)
         db.commit()
 
-        update_task_status(db, task_id, "processing", f"Parsed {total_subs} lines. Generating voice chunks...")
+        update_task_status(db, task_id, "processing", f"Parsed {total_subs} lines. Generating neural chunks...")
 
         lines = db.query(SubtitleLine).filter(SubtitleLine.task_id == task_id).order_by(SubtitleLine.line_index).all()
         
@@ -194,7 +193,7 @@ HTML_UI = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Hindi TTS & SRT Sync Dashboard</title>
+    <title>Hindi Neural TTS & SRT Sync Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
@@ -343,7 +342,7 @@ HTML_UI = """
             
             statusBox.classList.remove('hidden');
             progressText.textContent = "Uploading & queuing...";
-            progressBar.style.width = "10%";
+            progressBar.style.width = "10id%";
 
             const res = await fetch('/convert/', { method: 'POST', body: formData });
             const data = await res.json();
