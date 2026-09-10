@@ -35,7 +35,11 @@ class SubtitleLine(Base):
     audio_data = Column(LargeBinary, nullable=True)
     status = Column(String, default="pending")
 
-Base.metadata.create_all(bind=engine)
+# Automatically add missing columns if tables already exist
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception:
+    pass
 
 app = FastAPI(title="Precise Timestamp SRT to Hindi Neural TTS")
 
@@ -199,7 +203,7 @@ HTML_UI = """
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
     <!-- Navigation Bar -->
-    <nav class="bg-slate-900 border-b border-slate-800 px-4 sm:px-6 py-3 flex justify-between items-center">
+    <nav class="bg-slate-900 border-b border-slate-800 px-4 sm:px-6 py-3 flex justify-between items-center shadow-md">
         <span class="font-bold text-base sm:text-lg text-indigo-400">HindiVoice Studio</span>
         <div class="flex gap-2">
             <button onclick="switchPage('converter')" id="navConverter" class="px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-indigo-600 text-white transition">Converter</button>
