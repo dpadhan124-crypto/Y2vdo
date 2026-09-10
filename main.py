@@ -193,25 +193,26 @@ HTML_UI = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hindi Neural TTS & SRT Sync Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen">
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
     <!-- Navigation Bar -->
-    <nav class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex justify-between items-center">
-        <span class="font-bold text-lg text-indigo-400">HindiVoice Studio</span>
-        <div class="flex gap-3">
-            <button onclick="switchPage('converter')" id="navConverter" class="px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition">Converter</button>
-            <button onclick="switchPage('dashboard')" id="navDashboard" class="px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition">Dashboard</button>
+    <nav class="bg-slate-900 border-b border-slate-800 px-4 sm:px-6 py-3 flex justify-between items-center">
+        <span class="font-bold text-base sm:text-lg text-indigo-400">HindiVoice Studio</span>
+        <div class="flex gap-2">
+            <button onclick="switchPage('converter')" id="navConverter" class="px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-indigo-600 text-white transition">Converter</button>
+            <button onclick="switchPage('dashboard')" id="navDashboard" class="px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition">Dashboard</button>
         </div>
     </nav>
 
-    <main class="max-w-2xl mx-auto p-4 mt-8">
+    <main class="flex-grow flex items-center justify-center p-3 sm:p-4 my-auto w-full max-w-xl mx-auto">
         <!-- Converter Page -->
-        <div id="converterPage" class="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
+        <div id="converterPage" class="w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-4 sm:p-6">
             <div class="flex gap-2 mb-6">
-                <button id="tabSrt" onclick="switchTab('srt')" class="flex-1 py-2 rounded-xl font-medium bg-indigo-600 text-white transition">SRT to MP3</button>
-                <button id="tabText" onclick="switchTab('text')" class="flex-1 py-2 rounded-xl font-medium bg-slate-800 text-slate-400 transition">TEXT to MP3</button>
+                <button id="tabSrt" onclick="switchTab('srt')" class="flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-indigo-600 text-white transition">SRT to MP3</button>
+                <button id="tabText" onclick="switchTab('text')" class="flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-slate-800 text-slate-400 transition">TEXT to MP3</button>
             </div>
 
             <!-- SRT Form -->
@@ -226,8 +227,8 @@ HTML_UI = """
                             <option value="hi-IN-AnanyaNeural">Ananya (Female)</option>
                         </select>
                     </div>
-                    <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
-                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Processing</button>
+                    <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-xs sm:text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs sm:file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition text-sm">Start Processing</button>
                 </form>
             </div>
 
@@ -246,24 +247,24 @@ HTML_UI = """
                     <div>
                         <textarea name="text_content" rows="4" placeholder="Enter Hindi text here..." required class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-600"></textarea>
                     </div>
-                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Generate Audio</button>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition text-sm">Generate Audio</button>
                 </form>
             </div>
 
             <!-- Progress & Status Box -->
             <div id="statusBox" class="hidden mt-6 space-y-3 border-t border-slate-800 pt-4">
-                <p id="progressText" class="text-sm text-indigo-400 font-medium text-center animate-pulse">Initializing...</p>
+                <p id="progressText" class="text-xs sm:text-sm text-indigo-400 font-medium text-center animate-pulse">Initializing...</p>
                 <div class="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
                     <div id="progressBar" class="bg-indigo-600 h-2.5 w-0 transition-all duration-500"></div>
                 </div>
-                <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center">Download MP3</a>
+                <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center text-sm">Download MP3</a>
             </div>
         </div>
 
         <!-- Dashboard Page -->
-        <div id="dashboardPage" class="hidden bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
-            <h2 class="text-lg font-bold mb-4">File Processing History</h2>
-            <div id="taskList" class="space-y-3 max-h-[60vh] overflow-y-auto">
+        <div id="dashboardPage" class="hidden w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-4 sm:p-6">
+            <h2 class="text-base sm:text-lg font-bold mb-4">File Processing History</h2>
+            <div id="taskList" class="space-y-3 max-h-[60vh] overflow-y-auto pr-1">
                 <p class="text-sm text-slate-500 text-center py-4">Loading tasks...</p>
             </div>
         </div>
@@ -279,13 +280,13 @@ HTML_UI = """
             if(page === 'converter') {
                 convPage.classList.remove('hidden');
                 dashPage.classList.add('hidden');
-                navConv.className = "px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition";
-                navDash.className = "px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
+                navConv.className = "px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-indigo-600 text-white transition";
+                navDash.className = "px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
             } else {
                 convPage.classList.add('hidden');
                 dashPage.classList.remove('hidden');
-                navDash.className = "px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition";
-                navConv.className = "px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
+                navDash.className = "px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-indigo-600 text-white transition";
+                navConv.className = "px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl text-xs sm:text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
                 loadDashboardTasks();
             }
         }
@@ -300,13 +301,13 @@ HTML_UI = """
             if(tab === 'srt') {
                 srtSec.classList.remove('hidden');
                 txtSec.classList.add('hidden');
-                tabSrt.className = "flex-1 py-2 rounded-xl font-medium bg-indigo-600 text-white transition";
-                tabText.className = "flex-1 py-2 rounded-xl font-medium bg-slate-800 text-slate-400 transition";
+                tabSrt.className = "flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-indigo-600 text-white transition";
+                tabText.className = "flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-slate-800 text-slate-400 transition";
             } else {
                 srtSec.classList.add('hidden');
                 txtSec.classList.remove('hidden');
-                tabText.className = "flex-1 py-2 rounded-xl font-medium bg-indigo-600 text-white transition";
-                tabSrt.className = "flex-1 py-2 rounded-xl font-medium bg-slate-800 text-slate-400 transition";
+                tabText.className = "flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-indigo-600 text-white transition";
+                tabSrt.className = "flex-1 py-2 text-xs sm:text-sm rounded-xl font-medium bg-slate-800 text-slate-400 transition";
             }
         }
 
@@ -321,13 +322,13 @@ HTML_UI = """
             }
 
             listEl.innerHTML = tasks.map(t => `
-                <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
-                    <div>
-                        <p class="text-sm font-medium text-slate-200">${t.filename}</p>
-                        <p class="text-xs text-slate-400">Status: <span class="${t.status === 'completed' ? 'text-emerald-400' : t.status === 'failed' ? 'text-rose-400' : 'text-amber-400'}">${t.status}</span> - ${t.progress}</p>
+                <div class="bg-slate-950 border border-slate-800 p-3 sm:p-4 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                    <div class="w-full sm:w-auto overflow-hidden">
+                        <p class="text-xs sm:text-sm font-medium text-slate-200 truncate">${t.filename}</p>
+                        <p class="text-[11px] sm:text-xs text-slate-400 mt-0.5">Status: <span class="${t.status === 'completed' ? 'text-emerald-400' : t.status === 'failed' ? 'text-rose-400' : 'text-amber-400'}">${t.status}</span> - ${t.progress}</p>
                     </div>
-                    <div>
-                        ${t.status === 'completed' ? `<a href="/download/${t.task_id}" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-2 rounded-lg font-medium transition">Download</a>` : ''}
+                    <div class="w-full sm:w-auto text-right">
+                        ${t.status === 'completed' ? `<a href="/download/${t.task_id}" class="inline-block w-full sm:w-auto bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-2 rounded-lg font-medium transition text-center">Download</a>` : ''}
                     </div>
                 </div>
             `).join('');
@@ -342,7 +343,7 @@ HTML_UI = """
             
             statusBox.classList.remove('hidden');
             progressText.textContent = "Uploading & queuing...";
-            progressBar.style.width = "10id%";
+            progressBar.style.width = "10%";
 
             const res = await fetch('/convert/', { method: 'POST', body: formData });
             const data = await res.json();
