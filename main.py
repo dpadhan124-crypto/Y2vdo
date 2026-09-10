@@ -9,17 +9,22 @@ from typing import List, Optional
 from fastapi import FastAPI, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey, inspect
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 from pydub import AudioSegment
 import edge_tts
 
 # ==========================================
-# CONFIGURATION & DATABASE SETUP
+# CONFIGURATION & SUPABASE DATABASE SETUP
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/tts_db")
 
-engine = create_engine(DATABASE_URL)
+# Automatically handle SSL requirements for Supabase / remote PostgreSQL providers
+connect_args = {}
+if "supabase.co" in DATABASE_URL or "neon.tech" in DATABASE_URL or "render.com" in DATABASE_URL:
+    connect_args = {"sslmode": "require"}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -51,12 +56,11 @@ class SubtitleLine(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    # Automatic fallback schema inspection/migration check for columns like filename
     inspector = inspect(engine)
     columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
     if 'filename' not in columns:
         with engine.begin() as conn:
-            conn.execute("ALTER TABLE conversion_tasks ADD COLUMN filename VARCHAR(255);")
+            conn.execute(text("ALTER TABLE conversion_tasks ADD COLUMN filename VARCHAR(255);"))
 
 init_db()
 
@@ -67,7 +71,6 @@ def get_db():
     finally:
         db.close()
 
-# Ensure output storage directory exists
 OUTPUT_DIR = os.path.join(os.getcwd(), "generated_audio")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -87,7 +90,6 @@ VOICE_MAP = {
 # SRT PARSING UTILITIES
 # ==========================================
 def parse_timestamp(ts_str: str) -> int:
-    """Converts SRT timestamp (HH:MM:SS,ms) to total milliseconds."""
     match = re.match(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})", ts_str.strip())
     if not match:
         return 0
@@ -95,7 +97,6 @@ def parse_timestamp(ts_str: str) -> int:
     return (h * 3600 + m * 60 + s) * 1000 + ms
 
 def parse_srt_content(content: str) -> List[dict]:
-    """Parses raw SRT file content into a list of subtitle dictionaries."""
     pattern = re.compile(
         r"(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\n\d+\s*\n|\Z)",
         re.DOTALL
@@ -120,7 +121,6 @@ def parse_srt_content(content: str) -> List[dict]:
 # BACKGROUND TTS GENERATION ENGINE
 # ==========================================
 async def generate_speech_chunk(text: str, voice_name: str, output_filepath: str, retries: int = 3):
-    """Generates audio for a single text fragment using edge-tts with fallback retries."""
     voice_id = VOICE_MAP.get(voice_name, "hi-IN-SwaraNeural")
     for attempt in range(retries):
         try:
@@ -135,11 +135,9 @@ async def generate_speech_chunk(text: str, voice_name: str, output_filepath: str
     return False
 
 def change_audio_speed(segment: AudioSegment, speed: float) -> AudioSegment:
-    """Changes the speed of an AudioSegment while preserving pitch using frame rate modification."""
     if speed == 1.0:
         return segment
     try:
-        # Constrain speed securely
         speed = max(0.8, min(1.2, speed))
         new_sample_rate = int(segment.frame_rate * speed)
         altered = segment._spawn(segment.raw_data, overrides={'frame_rate': new_sample_rate})
@@ -176,23 +174,19 @@ async def process_srt_task(task_id: int):
                 success = await generate_speech_chunk(line.text, task.voice, chunk_path)
                 
                 if not success or not os.path.exists(chunk_path):
-                    # Fallback silent audio block matching time slot if generation fails completely
                     slot_duration = max(500, line.end_ms - line.start_ms)
                     segment = AudioSegment.silent(duration=slot_duration)
                 else:
                     segment = AudioSegment.from_file(chunk_path, format="mp3")
 
-                # Timeline mapping & Slot constraints calculation
                 target_slot_duration = line.end_ms - line.start_ms
                 actual_duration = len(segment)
 
                 if actual_duration > 0 and target_slot_duration > 0:
                     calculated_speed = actual_duration / target_slot_duration
-                    # Strict speed stretching bounds between 0.8x and 1.2x
                     clamped_speed = max(0.8, min(1.2, calculated_speed))
                     segment = change_audio_speed(segment, clamped_speed)
 
-                # Handle timeline gaps / minimum slot matching offsets
                 if line.start_ms > current_timeline_cursor:
                     gap_duration = line.start_ms - current_timeline_cursor
                     master_track += AudioSegment.silent(duration=gap_duration)
@@ -368,7 +362,6 @@ async def clear_database(db: Session = Depends(get_db)):
         db.query(SubtitleLine).delete()
         db.query(ConversionTask).delete()
         db.commit()
-        # Clean physical audio files
         for f in os.listdir(OUTPUT_DIR):
             fp = os.path.join(OUTPUT_DIR, f)
             if os.path.isfile(fp):
@@ -414,7 +407,6 @@ HTML_TEMPLATE = """
 </head>
 <body class="bg-darker text-gray-100 min-h-screen flex flex-col font-sans selection:bg-accent selection:text-white">
 
-    <!-- Header Navbar -->
     <header class="border-b border-gray-800 bg-darkcard/50 backdrop-blur sticky top-0 z-50">
         <div class="max-w-6xl mx-auto px-4 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
             <div class="flex items-center space-x-3">
@@ -431,10 +423,8 @@ HTML_TEMPLATE = """
         </div>
     </header>
 
-    <!-- Main Container -->
     <main class="max-w-4xl w-full mx-auto px-4 py-8 flex-grow">
 
-        <!-- CONVERT TAB -->
         <section id="tab-convert" class="space-y-6">
             <div class="bg-darkcard border border-gray-800 rounded-2xl p-6 sm:p-8 shadow-2xl relative overflow-hidden">
                 <div class="absolute top-0 right-0 w-32 h-32 bg-accent/5 rounded-full blur-3xl pointer-events-none"></div>
@@ -443,14 +433,12 @@ HTML_TEMPLATE = """
                     <span>⚡</span> Dual Mode Configuration
                 </h2>
 
-                <!-- Mode Select Tabs -->
                 <div class="grid grid-cols-2 gap-3 mb-6 bg-gray-900/60 p-1.5 rounded-xl border border-gray-800">
                     <button type="button" onclick="setMode('srt')" id="mode-btn-srt" class="py-2.5 rounded-lg text-sm font-semibold transition bg-accent text-white shadow">SRT File to MP3</button>
                     <button type="button" onclick="setMode('text')" id="mode-btn-text" class="py-2.5 rounded-lg text-sm font-semibold transition text-gray-400 hover:text-white">Raw Text to MP3</button>
                 </div>
 
                 <form id="conversion-form" onsubmit="handleSubmission(event)" class="space-y-5">
-                    <!-- Neural Voice Selection -->
                     <div>
                         <label class="block text-sm font-medium text-gray-300 mb-2">Select Indian Hindi Neural Voice</label>
                         <select name="voice" id="voice-select" class="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-gray-100 focus:outline-none focus:ring-2 focus:ring-accent transition">
@@ -461,7 +449,6 @@ HTML_TEMPLATE = """
                         </select>
                     </div>
 
-                    <!-- SRT File Input Container -->
                     <div id="input-container-srt" class="space-y-2">
                         <label class="block text-sm font-medium text-gray-300">Upload Subtitle File (.srt)</label>
                         <div class="border-2 border-dashed border-gray-700 hover:border-accent rounded-2xl p-6 text-center transition bg-gray-900/40 cursor-pointer relative" onclick="document.getElementById('srt-file').click()">
@@ -472,19 +459,16 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
 
-                    <!-- Direct Text Input Container -->
                     <div id="input-container-text" class="space-y-2 hidden">
                         <label class="block text-sm font-medium text-gray-300">Enter Raw Hindi Text</label>
                         <textarea name="text" id="raw-text" rows="5" placeholder="यहाँ अपना हिंदी पाठ दर्ज करें..." class="w-full bg-gray-900 border border-gray-700 rounded-xl p-4 text-gray-100 focus:outline-none focus:ring-2 focus:ring-accent transition resize-none"></textarea>
                     </div>
 
-                    <!-- Submit Button -->
                     <button type="submit" id="submit-btn" class="w-full bg-accent hover:bg-accenthover text-white font-medium py-3.5 px-6 rounded-xl transition shadow-lg flex items-center justify-center gap-2">
                         <span>🚀</span> Start Neural Conversion
                     </button>
                 </form>
 
-                <!-- Progress Tracker Box -->
                 <div id="progress-box" class="hidden mt-8 bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
                     <div class="flex justify-between items-center text-sm">
                         <span id="progress-status-label" class="font-medium text-accent">Processing background queue...</span>
@@ -495,7 +479,6 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <!-- Result Audio Card -->
                 <div id="result-box" class="hidden mt-8 bg-gray-900 border border-green-500/30 rounded-xl p-5 space-y-4">
                     <div class="flex items-center gap-3">
                         <div class="bg-green-500/20 p-2 rounded-lg text-green-400">✅</div>
@@ -512,7 +495,6 @@ HTML_TEMPLATE = """
             </div>
         </section>
 
-        <!-- DASHBOARD TAB -->
         <section id="tab-dashboard" class="space-y-6 hidden">
             <div class="bg-darkcard border border-gray-800 rounded-2xl p-6 sm:p-8 shadow-2xl">
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
@@ -526,7 +508,6 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <!-- Tasks Table / Cards -->
                 <div id="tasks-container" class="space-y-3">
                     <p class="text-center text-gray-500 py-8 text-sm">Loading historical task entries...</p>
                 </div>
@@ -535,12 +516,10 @@ HTML_TEMPLATE = """
 
     </main>
 
-    <!-- Footer -->
     <footer class="border-t border-gray-800 bg-darkcard/30 text-center py-4 text-xs text-gray-500">
-        Powered by FastAPI, PostgreSQL, Tailwind CSS, and Microsoft Edge Neural TTS.
+        Powered by FastAPI, Supabase PostgreSQL, Tailwind CSS, and Microsoft Edge Neural TTS.
     </footer>
 
-    <!-- Frontend Scripting Logic -->
     <script>
         let currentMode = 'srt';
         let activePollingInterval = null;
@@ -621,7 +600,6 @@ HTML_TEMPLATE = """
                 submitPayload.append('text', textVal);
             }
 
-            // UI feedback state update
             const submitBtn = document.getElementById('submit-btn');
             submitBtn.disabled = true;
             submitBtn.innerText = "Initializing Background Queue...";
@@ -662,7 +640,6 @@ HTML_TEMPLATE = """
                         resetSubmitButton();
                         document.getElementById('progress-box').classList.add('hidden');
                         
-                        // Setup Audio Player
                         const audioPlayer = document.getElementById('audio-player');
                         const downloadLink = document.getElementById('download-link');
                         audioPlayer.src = `/download/${taskId}`;
@@ -715,10 +692,11 @@ HTML_TEMPLATE = """
                             <div class="space-y-1">
                                 <div class="flex items-center gap-2">
                                     <span class="text-xs font-mono text-gray-400">#${t.id}</span>
-                                    <span class="text-xs uppercase px-2 py-0.5 bg-gray-800 text-gray-300 rounded">${t.mode}</span>${statusBadge}
+                                    <span class="text-xs uppercase px-2 py-0.5 bg-gray-800 text-gray-300 rounded">${t.mode}</span>
+                                    ${statusBadge}
                                 </div>
                                 <h4 class="font-medium text-white text-sm truncate max-w-xs sm:max-w-md">${t.filename}</h4>
-                                <p class="text-xs text-gray-400">Voice: <span class="text-gray-200">${t.voice}</span> \vert{} Created:${t.created_at}</p>
+                                <p class="text-xs text-gray-400">Voice: <span class="text-gray-200">${t.voice}</span> | Created: ${t.created_at}</p>
                                 <p class="text-xs text-accent italic">${t.progress_message}</p>
                             </div>
                             <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
@@ -754,4 +732,5 @@ HTML_TEMPLATE = """
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
