@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-edge-tts
 pysrt
+edge-tts
 pydub
-python-multipart
+SQLAlchemy
 psycopg2-binary
