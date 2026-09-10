@@ -1,12 +1,13 @@
 import os
 import uuid
 import time
+import asyncio
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse, FileResponse
 import pysrt
-from gtts import gTTS
+import edge_tts
 from pydub import AudioSegment
-from sqlalchemy import create_engine, Column, String, LargeBinary, Integer, Text, Float
+from sqlalchemy import create_engine, Column, String, LargeBinary, Integer, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -19,6 +20,7 @@ Base = declarative_base()
 class ConversionTask(Base):
     __tablename__ = "conversion_tasks"
     task_id = Column(String, primary_key=True, index=True)
+    filename = Column(String, default="audio.mp3")
     status = Column(String, default="processing")
     progress = Column(String, default="Queued...")
     merged_audio_data = Column(LargeBinary, nullable=True)
@@ -36,12 +38,19 @@ class SubtitleLine(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Precise Timestamp SRT to Hindi TTS")
+app = FastAPI(title="Precise Timestamp SRT to Hindi TTS Dashboard")
 
 def srt_time_to_ms(t):
     return (t.hours * 3600 + t.minutes * 60 + t.seconds) * 1000 + t.milliseconds
 
-def process_srt_in_background(task_id: str, input_path: str, tld: str):
+def update_task_status(db, task_id, status, progress):
+    task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
+    if task:
+        task.status = status
+        task.progress = progress
+        db.commit()
+
+async def process_srt_in_background(task_id: str, input_path: str, voice: str):
     db = SessionLocal()
     try:
         try:
@@ -70,7 +79,7 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
             db.add(db_line)
         db.commit()
 
-        update_task_status(db, task_id, "processing", f"Parsed {total_subs} lines. Generating TTS chunks...")
+        update_task_status(db, task_id, "processing", f"Parsed {total_subs} lines. Generating voice chunks...")
 
         lines = db.query(SubtitleLine).filter(SubtitleLine.task_id == task_id).order_by(SubtitleLine.line_index).all()
         
@@ -84,8 +93,8 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
             
             temp_chunk = f"chunk_{task_id}_{i}.mp3"
             try:
-                tts = gTTS(text=line.text, lang='hi', tld=tld, slow=False)
-                tts.save(temp_chunk)
+                communicate = edge_tts.Communicate(line.text, voice)
+                await communicate.save(temp_chunk)
                 
                 with open(temp_chunk, "rb") as f:
                     line.audio_data = f.read()
@@ -95,10 +104,10 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
                 if os.path.exists(temp_chunk):
                     os.remove(temp_chunk)
             except Exception:
-                time.sleep(2)
+                await asyncio.sleep(2)
                 try:
-                    tts = gTTS(text=line.text, lang='hi', tld=tld, slow=False)
-                    tts.save(temp_chunk)
+                    communicate = edge_tts.Communicate(line.text, voice)
+                    await communicate.save(temp_chunk)
                     with open(temp_chunk, "rb") as f:
                         line.audio_data = f.read()
                     line.status = "done"
@@ -108,7 +117,7 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
                 except Exception:
                     pass
             
-            time.sleep(0.5)
+            await asyncio.sleep(0.2)
 
         update_task_status(db, task_id, "processing", "Stitching timeline matching exact SRT timestamps...")
         
@@ -142,14 +151,12 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
                 speed_factor = audio_len / target_duration
                 if speed_factor > 1.2:
                     speed_factor = 1.2
-                
                 new_framerate = int(segment.frame_rate * speed_factor)
                 segment = segment._spawn(segment.raw_data, overrides={'frame_rate': new_framerate}).set_frame_rate(44100)
             elif audio_len < target_duration:
                 speed_factor = audio_len / target_duration
                 if speed_factor < 0.8:
                     speed_factor = 0.8
-                
                 new_framerate = int(segment.frame_rate * speed_factor)
                 segment = segment._spawn(segment.raw_data, overrides={'frame_rate': new_framerate}).set_frame_rate(44100)
 
@@ -165,7 +172,7 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
         task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
         if task:
             task.status = "completed"
-            task.progress = "Completed successfully with exact timestamp alignment!"
+            task.progress = "Completed successfully!"
             task.merged_audio_data = merged_bytes
             db.commit()
 
@@ -182,75 +189,108 @@ def process_srt_in_background(task_id: str, input_path: str, tld: str):
         if os.path.exists(input_path):
             os.remove(input_path)
 
-def update_task_status(db, task_id, status, progress):
-    task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
-    if task:
-        task.status = status
-        task.progress = progress
-        db.commit()
-
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Precise SRT to Hindi TTS Sync</title>
+    <title>Hindi TTS & SRT Sync Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
-        <div class="flex gap-2 mb-6">
-            <button id="tabSrt" onclick="switchTab('srt')" class="flex-1 py-2 rounded-xl font-medium bg-indigo-600 text-white transition">SRT to MP3</button>
-            <button id="tabText" onclick="switchTab('text')" class="flex-1 py-2 rounded-xl font-medium bg-slate-800 text-slate-400 transition">TEXT to MP3</button>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+    <!-- Navigation Bar -->
+    <nav class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex justify-between items-center">
+        <span class="font-bold text-lg text-indigo-400">HindiVoice Studio</span>
+        <div class="flex gap-3">
+            <button onclick="switchPage('converter')" id="navConverter" class="px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition">Converter</button>
+            <button onclick="switchPage('dashboard')" id="navDashboard" class="px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition">Dashboard</button>
+        </div>
+    </nav>
+
+    <main class="max-w-2xl mx-auto p-4 mt-8">
+        <!-- Converter Page -->
+        <div id="converterPage" class="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
+            <div class="flex gap-2 mb-6">
+                <button id="tabSrt" onclick="switchTab('srt')" class="flex-1 py-2 rounded-xl font-medium bg-indigo-600 text-white transition">SRT to MP3</button>
+                <button id="tabText" onclick="switchTab('text')" class="flex-1 py-2 rounded-xl font-medium bg-slate-800 text-slate-400 transition">TEXT to MP3</button>
+            </div>
+
+            <!-- SRT Form -->
+            <div id="srtSection">
+                <form id="uploadForm" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 mb-1">Select Voice Speaker</label>
+                        <select name="voice" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-600">
+                            <option value="hi-IN-MadhurNeural">Madhur (Male)</option>
+                            <option value="hi-IN-SwaraNeural">Swara (Female)</option>
+                            <option value="hi-IN-AaravNeural">Aarav (Male)</option>
+                            <option value="hi-IN-AnanyaNeural">Ananya (Female)</option>
+                        </select>
+                    </div>
+                    <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Processing</button>
+                </form>
+            </div>
+
+            <!-- Text Form -->
+            <div id="textSection" class="hidden">
+                <form id="textForm" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 mb-1">Select Voice Speaker</label>
+                        <select name="voice" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-600">
+                            <option value="hi-IN-MadhurNeural">Madhur (Male)</option>
+                            <option value="hi-IN-SwaraNeural">Swara (Female)</option>
+                            <option value="hi-IN-AaravNeural">Aarav (Male)</option>
+                            <option value="hi-IN-AnanyaNeural">Ananya (Female)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <textarea name="text_content" rows="4" placeholder="Enter Hindi text here..." required class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-600"></textarea>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Generate Audio</button>
+                </form>
+            </div>
+
+            <!-- Progress & Status Box -->
+            <div id="statusBox" class="hidden mt-6 space-y-3 border-t border-slate-800 pt-4">
+                <p id="progressText" class="text-sm text-indigo-400 font-medium text-center animate-pulse">Initializing...</p>
+                <div class="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
+                    <div id="progressBar" class="bg-indigo-600 h-2.5 w-0 transition-all duration-500"></div>
+                </div>
+                <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center">Download MP3</a>
+            </div>
         </div>
 
-        <div id="srtSection">
-            <h1 class="text-xl font-bold text-center mb-1">Timestamp-Synced SRT Audio</h1>
-            <p class="text-xs text-slate-400 text-center mb-4">Runs securely in background chunks.</p>
-            
-            <form id="uploadForm" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-medium text-slate-400 mb-1">Select Hindi Voice Accent (gTTS Domain)</label>
-                    <select name="tld" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-600">
-                        <option value="co.in">India (co.in)</option>
-                        <option value="com">Global (com)</option>
-                        <option value="co.uk">United Kingdom (co.uk)</option>
-                        <option value="ca">Canada (ca)</option>
-                    </select>
-                </div>
-                <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
-                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Background Processing</button>
-            </form>
+        <!-- Dashboard Page -->
+        <div id="dashboardPage" class="hidden bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
+            <h2 class="text-lg font-bold mb-4">File Processing History</h2>
+            <div id="taskList" class="space-y-3 max-h-[60vh] overflow-y-auto">
+                <p class="text-sm text-slate-500 text-center py-4">Loading tasks...</p>
+            </div>
         </div>
-
-        <div id="textSection" class="hidden">
-            <h1 class="text-xl font-bold text-center mb-1">Direct Text to Hindi Audio</h1>
-            <p class="text-xs text-slate-400 text-center mb-4">Convert raw text directly into speech.</p>
-            
-            <form id="textForm" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-medium text-slate-400 mb-1">Select Hindi Voice Accent</label>
-                    <select name="tld" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-600">
-                        <option value="co.in">India (co.in)</option>
-                        <option value="com">Global (com)</option>
-                        <option value="co.uk">United Kingdom (co.uk)</option>
-                        <option value="ca">Canada (ca)</option>
-                    </select>
-                </div>
-                <div>
-                    <textarea name="text_content" rows="4" placeholder="Enter Hindi text here..." required class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-600"></textarea>
-                </div>
-                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Generate Audio</button>
-            </form>
-        </div>
-
-        <div id="statusBox" class="hidden mt-6 space-y-3 text-center border-t border-slate-800 pt-4">
-            <p id="progressText" class="text-sm text-indigo-400 font-medium animate-pulse">Initializing...</p>
-            <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center">Download MP3</a>
-        </div>
-    </div>
+    </main>
 
     <script>
+        function switchPage(page) {
+            const convPage = document.getElementById('converterPage');
+            const dashPage = document.getElementById('dashboardPage');
+            const navConv = document.getElementById('navConverter');
+            const navDash = document.getElementById('navDashboard');
+
+            if(page === 'converter') {
+                convPage.classList.remove('hidden');
+                dashPage.classList.add('hidden');
+                navConv.className = "px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition";
+                navDash.className = "px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
+            } else {
+                convPage.classList.add('hidden');
+                dashPage.classList.remove('hidden');
+                navDash.className = "px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition";
+                navConv.className = "px-4 py-2 rounded-xl text-sm font-medium bg-slate-800 text-slate-400 hover:text-white transition";
+                loadDashboardTasks();
+            }
+        }
+
         function switchTab(tab) {
             const srtSec = document.getElementById('srtSection');
             const txtSec = document.getElementById('textSection');
@@ -271,14 +311,39 @@ HTML_UI = """
             }
         }
 
+        async function loadDashboardTasks() {
+            const res = await fetch('/tasks');
+            const tasks = await res.json();
+            const listEl = document.getElementById('taskList');
+            
+            if(tasks.length === 0) {
+                listEl.innerHTML = '<p class="text-sm text-slate-500 text-center py-4">No tasks found.</p>';
+                return;
+            }
+
+            listEl.innerHTML = tasks.map(t => `
+                <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
+                    <div>
+                        <p class="text-sm font-medium text-slate-200">${t.filename}</p>
+                        <p class="text-xs text-slate-400">Status: <span class="${t.status === 'completed' ? 'text-emerald-400' : t.status === 'failed' ? 'text-rose-400' : 'text-amber-400'}">${t.status}</span> - ${t.progress}</p>
+                    </div>
+                    <div>
+                        ${t.status === 'completed' ? `<a href="/download/${t.task_id}" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-2 rounded-lg font-medium transition">Download</a>` : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(e.target);
             const statusBox = document.getElementById('statusBox');
             const progressText = document.getElementById('progressText');
+            const progressBar = document.getElementById('progressBar');
             
             statusBox.classList.remove('hidden');
-            progressText.textContent = "Uploading & scheduling background worker...";
+            progressText.textContent = "Uploading & queuing...";
+            progressBar.style.width = "10%";
 
             const res = await fetch('/convert/', { method: 'POST', body: formData });
             const data = await res.json();
@@ -295,13 +360,17 @@ HTML_UI = """
                 
                 if(statusData.status === 'completed') {
                     clearInterval(interval);
-                    progressText.textContent = "Sync complete! Click below to download.";
+                    progressBar.style.width = "100%";
+                    progressText.textContent = "Sync complete!";
                     const dlBtn = document.getElementById('downloadBtn');
                     dlBtn.href = `/download/${taskId}`;
                     dlBtn.classList.remove('hidden');
                 } else if(statusData.status === 'failed') {
                     clearInterval(interval);
+                    progressBar.style.backgroundColor = "#f43f5e";
                     progressText.textContent = statusData.progress;
+                } else {
+                    progressBar.style.width = "50%";
                 }
             }, 3000);
         });
@@ -311,10 +380,12 @@ HTML_UI = """
             const formData = new FormData(e.target);
             const statusBox = document.getElementById('statusBox');
             const progressText = document.getElementById('progressText');
+            const progressBar = document.getElementById('progressBar');
             const dlBtn = document.getElementById('downloadBtn');
             
             statusBox.classList.remove('hidden');
             progressText.textContent = "Generating audio from text...";
+            progressBar.style.width = "50%";
             dlBtn.classList.add('hidden');
 
             const res = await fetch('/convert-text/', { method: 'POST', body: formData });
@@ -322,7 +393,8 @@ HTML_UI = """
             
             if(!res.ok) { progressText.textContent = data.detail; return; }
 
-            progressText.textContent = "Conversion complete! Click below to download.";
+            progressBar.style.width = "100%";
+            progressText.textContent = "Conversion complete!";
             dlBtn.href = `/download/${data.task_id}`;
             dlBtn.classList.remove('hidden');
         });
@@ -336,7 +408,7 @@ def read_root():
     return HTMLResponse(content=HTML_UI)
 
 @app.post("/convert/")
-async def convert_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...), tld: str = Form("co.in")):
+async def convert_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...), voice: str = Form("hi-IN-MadhurNeural")):
     if not file.filename.lower().endswith('.srt'):
         raise HTTPException(status_code=400, detail="Only .srt files accepted.")
     
@@ -348,16 +420,16 @@ async def convert_endpoint(background_tasks: BackgroundTasks, file: UploadFile =
         f.write(contents)
         
     db = SessionLocal()
-    new_task = ConversionTask(task_id=task_id, status="processing", progress="Queued in database...")
+    new_task = ConversionTask(task_id=task_id, filename=file.filename, status="processing", progress="Queued...")
     db.add(new_task)
     db.commit()
     db.close()
     
-    background_tasks.add_task(process_srt_in_background, task_id, input_path, tld)
+    background_tasks.add_task(process_srt_in_background, task_id, input_path, voice)
     return {"task_id": task_id}
 
 @app.post("/convert-text/")
-async def convert_text_endpoint(text_content: str = Form(...), tld: str = Form("co.in")):
+async def convert_text_endpoint(text_content: str = Form(...), voice: str = Form("hi-IN-MadhurNeural")):
     if not text_content.strip():
         raise HTTPException(status_code=400, detail="Text content cannot be empty.")
     
@@ -365,8 +437,8 @@ async def convert_text_endpoint(text_content: str = Form(...), tld: str = Form("
     temp_audio = f"text_{task_id}.mp3"
     
     try:
-        tts = gTTS(text=text_content, lang='hi', tld=tld, slow=False)
-        tts.save(temp_audio)
+        communicate = edge_tts.Communicate(text_content, voice)
+        await communicate.save(temp_audio)
         
         with open(temp_audio, "rb") as f:
             audio_bytes = f.read()
@@ -377,6 +449,7 @@ async def convert_text_endpoint(text_content: str = Form(...), tld: str = Form("
         db = SessionLocal()
         new_task = ConversionTask(
             task_id=task_id, 
+            filename="text_conversion.mp3",
             status="completed", 
             progress="Completed successfully!", 
             merged_audio_data=audio_bytes
@@ -400,6 +473,13 @@ def get_status(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     return {"status": task.status, "progress": task.progress}
 
+@app.get("/tasks")
+def get_tasks():
+    db = SessionLocal()
+    tasks = db.query(ConversionTask).order_by(ConversionTask.task_id.desc()).all()
+    db.close()
+    return [{"task_id": t.task_id, "filename": t.filename, "status": t.status, "progress": t.progress} for t in tasks]
+
 @app.get("/download/{task_id}")
 def download_file(task_id: str):
     db = SessionLocal()
@@ -409,8 +489,9 @@ def download_file(task_id: str):
     if not task or not task.merged_audio_data:
         raise HTTPException(status_code=404, detail="File not ready or missing.")
     
-    output_filename = f"synced_audio_{task_id}.mp3"
+    output_filename = f"synced_{task_id}.mp3"
     with open(output_filename, "wb") as f:
         f.write(task.merged_audio_data)
         
-    return FileResponse(output_filename, media_type="audio/mpeg", filename="hindi_audio.mp3")
+    download_name = task.filename.rsplit('.', 1)[0] + "_synced.mp3" if task.filename else "audio_synced.mp3"
+    return FileResponse(output_filename, media_type="audio/mpeg", filename=download_name)
