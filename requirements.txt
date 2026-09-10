@@ -4,4 +4,5 @@ gTTS
 pysrt
 pydub
 python-multipart
-jinja2
+psycopg2-binary
+sqlalchemy
