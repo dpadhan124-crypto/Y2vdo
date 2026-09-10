@@ -1,123 +1,179 @@
 import os
-import shutil
 import uuid
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import time
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse
 import pysrt
 from gtts import gTTS
 from pydub import AudioSegment
+from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-app = FastAPI(title="SRT to Hindi MP3 Converter")
+# --- DATABASE SETUP (Supabase / Neon Free Postgres URL) ---
+# Replace with your free PostgreSQL connection string from Supabase or Neon
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@host:port/dbname")
 
-HTML_CONTENT = """
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class ConversionTask(Base):
+    __tablename__ = "conversion_tasks"
+    task_id = Column(String, primary_key=True, index=True)
+    status = Column(String, default="processing") # processing, completed, failed
+    progress = Column(String, default="0/0 parts")
+    download_path = Column(String, nullable=True)
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Large SRT to Hindi MP3 Converter")
+
+# --- BACKGROUND PROCESSOR ---
+def process_srt_in_background(task_id: str, input_path: str):
+    db = SessionLocal()
+    chunks_dir = f"chunks_{task_id}"
+    output_mp3_path = f"output_{task_id}.mp3"
+    
+    try:
+        os.makedirs(chunks_dir, exist_ok=True)
+        try:
+            subs = pysrt.open(input_path, encoding='utf-8')
+        except Exception:
+            subs = pysrt.open(input_path, encoding='latin-1')
+
+        if not subs:
+            update_task(db, task_id, status="failed", progress="Invalid SRT file")
+            return
+
+        # Group subtitles into ~2-minute clusters (120 seconds)
+        clusters = []
+        current_cluster = []
+        cluster_duration_ms = 0
+        
+        for sub in subs:
+            sub_duration = (sub.end.to_time().hour * 3600 + sub.end.to_time().minute * 60 + sub.end.to_time().second) * 1000 - \
+                           (sub.start.to_time().hour * 3600 + sub.start.to_time().minute * 60 + sub.start.to_time().second) * 1000
+            
+            current_cluster.append(sub.text.replace('\n', ' ').strip())
+            cluster_duration_ms += max(sub_duration, 1000)
+            
+            # If cluster reaches ~2 minutes (120,000 ms), push and reset
+            if cluster_duration_ms >= 120000:
+                clusters.append(" ".join(current_cluster))
+                current_cluster = []
+                cluster_duration_ms = 0
+                
+        if current_cluster:
+            clusters.append(" ".join(current_cluster))
+
+        total_parts = len(clusters)
+        combined_audio = AudioSegment.empty()
+        silence = AudioSegment.silent(duration=300)
+
+        for i, text_chunk in enumerate(clusters):
+            if not text_chunk.strip():
+                continue
+            
+            update_task(db, task_id, progress=f"Processing part {i+1} of {total_parts}")
+            
+            chunk_path = os.path.join(chunks_dir, f"part_{i}.mp3")
+            tts = gTTS(text=text_chunk, lang='hi', slow=False)
+            tts.save(chunk_path)
+            
+            segment = AudioSegment.from_mp3(chunk_path)
+            combined_audio += segment + silence
+            
+            # Brief pause to prevent hitting Google TTS rate limits (HTTP 429)
+            time.sleep(1)
+
+        combined_audio.export(output_mp3_path, format="mp3")
+        
+        # Mark complete
+        task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
+        if task:
+            task.status = "completed"
+            task.progress = f"Completed {total_parts} parts"
+            task.download_path = output_mp3_path
+            db.commit()
+
+    except Exception as e:
+        update_task(db, task_id, status="failed", progress=str(e))
+    finally:
+        db.close()
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(chunks_dir):
+            import shutil
+            shutil.rmtree(chunks_dir, ignore_errors=True)
+
+def update_task(db, task_id, status=None, progress=None):
+    task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
+    if task:
+        if status: task.status = status
+        if progress: task.progress = progress
+        db.commit()
+
+# --- FRONTEND UI ---
+HTML_UI = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SRT to Hindi MP3 Converter</title>
+    <title>Large SRT to Hindi MP3 Converter</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
-
-    <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 md:p-8">
-        <div class="text-center mb-6">
-            <h1 class="text-2xl font-bold tracking-tight text-white">SRT to Hindi Audio</h1>
-            <p class="text-sm text-slate-400 mt-1">Convert subtitle files (.srt) into high-quality Hindi MP3 voiceovers.</p>
-        </div>
-
+    <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
+        <h1 class="text-2xl font-bold text-center mb-2">Large SRT to Hindi Audio</h1>
+        <p class="text-xs text-slate-400 text-center mb-6">Splits file into 2-minute parts, processes securely via DB background queue.</p>
+        
         <form id="uploadForm" class="space-y-4">
-            <div class="relative border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-6 text-center cursor-pointer transition bg-slate-950/50" id="dropZone">
-                <input type="file" id="srtFile" name="file" accept=".srt" class="absolute inset-0 opacity-0 cursor-pointer w-full h-full" required>
-                <div class="space-y-2 pointer-events-none">
-                    <svg class="mx-auto h-10 w-10 text-slate-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
-                        <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                    <div class="text-sm text-slate-300">
-                        <span class="font-semibold text-indigo-400">Click to upload</span> or drag and drop
-                    </div>
-                    <p class="text-xs text-slate-500" id="fileNameDisplay">Only .srt files accepted</p>
-                </div>
-            </div>
-
-            <button type="submit" id="submitBtn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 px-4 rounded-xl transition shadow-lg shadow-indigo-600/20 disabled:opacity-50 disabled:cursor-not-allowed">
-                Convert to MP3
-            </button>
+            <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Chunk Processing</button>
         </form>
 
-        <div id="loadingState" class="hidden mt-6 text-center space-y-3">
-            <div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-indigo-500 border-t-transparent"></div>
-            <p class="text-sm text-slate-400 animate-pulse">Processing subtitles & generating Hindi audio chunks...</p>
-        </div>
-
-        <div id="errorBox" class="hidden mt-4 p-3 bg-red-950/50 border border-red-800 rounded-xl text-red-300 text-sm"></div>
-
-        <div id="resultBox" class="hidden mt-6 space-y-4 border-t border-slate-800 pt-6">
-            <div class="flex items-center justify-between">
-                <span class="text-sm font-medium text-emerald-400 flex items-center gap-1.5">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-                    Conversion Successful!
-                </span>
-            </div>
-            <audio id="audioPlayer" controls class="w-full rounded-lg"></audio>
-            <a id="downloadLink" class="block w-full text-center bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-xl transition shadow-lg shadow-emerald-600/20">
-                Download MP3 File
-            </a>
+        <div id="statusBox" class="hidden mt-6 space-y-3 text-center border-t border-slate-800 pt-4">
+            <p id="progressText" class="text-sm text-indigo-400 font-medium animate-pulse">Initializing...</p>
+            <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center">Download Merged MP3</a>
         </div>
     </div>
 
     <script>
-        const fileInput = document.getElementById('srtFile');
-        const fileNameDisplay = document.getElementById('fileNameDisplay');
-        const uploadForm = document.getElementById('uploadForm');
-        const submitBtn = document.getElementById('submitBtn');
-        const loadingState = document.getElementById('loadingState');
-        const errorBox = document.getElementById('errorBox');
-        const resultBox = document.getElementById('resultBox');
-        const audioPlayer = document.getElementById('audioPlayer');
-        const downloadLink = document.getElementById('downloadLink');
-
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                fileNameDisplay.textContent = e.target.files[0].name;
-            }
-        });
-
-        uploadForm.addEventListener('submit', async (e) => {
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            errorBox.classList.add('hidden');
-            resultBox.classList.add('hidden');
-            loadingState.classList.remove('hidden');
-            submitBtn.disabled = true;
+            const formData = new FormData(e.target);
+            const statusBox = document.getElementById('statusBox');
+            const progressText = document.getElementById('progressText');
+            
+            statusBox.classList.remove('hidden');
+            progressText.textContent = "Uploading & setting up database task...";
 
-            const formData = new FormData(uploadForm);
+            const res = await fetch('/convert/', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if(!res.ok) { progressText.textContent = data.detail; return; }
 
-            try {
-                const response = await fetch('/convert/', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Failed to process file.');
+            const taskId = data.task_id;
+            
+            // Poll status every 3 seconds
+            const interval = setInterval(async () => {
+                const statusRes = await fetch(`/status/${taskId}`);
+                const statusData = await statusRes.json();
+                
+                progressText.textContent = statusData.progress;
+                
+                if(statusData.status === 'completed') {
+                    clearInterval(interval);
+                    progressText.textContent = "Processing complete! Ready to download.";
+                    const dlBtn = document.getElementById('downloadBtn');
+                    dlBtn.href = `/download/${taskId}`;
+                    dlBtn.classList.remove('hidden');
+                } else if(statusData.status === 'failed') {
+                    clearInterval(interval);
+                    progressText.textContent = "Error: " + statusData.progress;
                 }
-
-                const blob = await response.blob();
-                const audioUrl = URL.createObjectURL(blob);
-
-                audioPlayer.src = audioUrl;
-                downloadLink.href = audioUrl;
-                downloadLink.download = "hindi_audio_output.mp3";
-
-                resultBox.classList.remove('hidden');
-            } catch (err) {
-                errorBox.textContent = err.message;
-                errorBox.classList.remove('hidden');
-            } finally {
-                loadingState.classList.add('hidden');
-                submitBtn.disabled = false;
-            }
+            }, 3000);
         });
     </script>
 </body>
@@ -125,66 +181,44 @@ HTML_CONTENT = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-def read_root():
-    return HTMLResponse(content=HTML_CONTENT)
+py_root = lambda: HTMLResponse(content=HTML_UI)
+app.add_api_route("/", py_root, methods=["GET"])
 
 @app.post("/convert/")
-async def convert_srt_to_mp3(file: UploadFile = File(...)):
+async def convert_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.srt'):
-        raise HTTPException(status_code=400, detail="Only .srt files are allowed.")
+        raise HTTPException(status_code=400, detail="Only .srt files accepted.")
     
-    unique_id = str(uuid.uuid4())
-    input_path = f"temp_{unique_id}.srt"
-    output_mp3_path = f"output_{unique_id}.mp3"
-    chunks_dir = f"chunks_{unique_id}"
+    task_id = str(uuid.uuid4())
+    input_path = f"temp_{task_id}.srt"
     
-    try:
-        contents = await file.read()
-        with open(input_path, "wb") as f:
-            f.write(contents)
-            
-        try:
-            subs = pysrt.open(input_path, encoding='utf-8')
-        except Exception:
-            subs = pysrt.open(input_path, encoding='latin-1')
-            
-        if not subs:
-            raise HTTPException(status_code=400, detail="The uploaded .srt file is empty or invalid.")
-            
-        os.makedirs(chunks_dir, exist_ok=True)
-        combined_audio = AudioSegment.empty()
-        silence = AudioSegment.silent(duration=300)
+    contents = await file.read()
+    with open(input_path, "wb") as f:
+        f.write(contents)
         
-        for i, sub in enumerate(subs):
-            text = sub.text.replace('\n', ' ').strip()
-            if not text:
-                continue
-                
-            chunk_path = os.path.join(chunks_dir, f"part_{i}.mp3")
-            tts = gTTS(text=text, lang='hi', slow=False)
-            tts.save(chunk_path)
-            
-            segment = AudioSegment.from_mp3(chunk_path)
-            combined_audio += segment + silence
-            
-        if len(combined_audio) == 0:
-            raise HTTPException(status_code=400, detail="No readable text found inside the .srt file.")
-            
-        combined_audio.export(output_mp3_path, format="mp3")
-        
-        return FileResponse(
-            output_mp3_path, 
-            media_type="audio/mpeg", 
-            filename="hindi_audio_output.mp3"
-        )
-        
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=f"Conversion processing error: {str(e)}")
-        
-    finally:
-        if os.path.exists(input_path):
-            os.remove(input_path)
-        if os.path.exists(chunks_dir):
-            shutil.rmtree(chunks_dir)
+    db = SessionLocal()
+    new_task = ConversionTask(task_id=task_id, status="processing", progress="Queued in database...")
+    db.add(new_task)
+    db.commit()
+    db.close()
+    
+    background_tasks.add_task(process_srt_in_background, task_id, input_path)
+    return {"task_id": task_id}
+
+@app.get("/status/{task_id}")
+def get_status(task_id: str):
+    db = SessionLocal()
+    task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
+    db.close()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"status": task.status, "progress": task.progress}
+
+@app.get("/download/{task_id}")
+def download_file(task_id: str):
+    db = SessionLocal()
+    task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
+    db.close()
+    if not task or not task.download_path or not os.path.exists(task.download_path):
+        raise HTTPException(status_code=404, detail="File not ready or missing.")
+    return FileResponse(task.download_path, media_type="audio/mpeg", filename="hindi_full_audio.mp3")
