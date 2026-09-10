@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 import pysrt
 import edge_tts
 from pydub import AudioSegment
-from sqlalchemy import create_engine, Column, String, LargeBinary, Integer, Text
+from sqlalchemy import create_engine, Column, String, LargeBinary, Integer, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -35,9 +35,11 @@ class SubtitleLine(Base):
     audio_data = Column(LargeBinary, nullable=True)
     status = Column(String, default="pending")
 
-# Automatically add missing columns if tables already exist
 try:
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        conn.execute(text('ALTER TABLE conversion_tasks ADD COLUMN IF NOT EXISTS filename VARCHAR DEFAULT "audio.mp3";'))
+        conn.commit()
 except Exception:
     pass
 
@@ -107,7 +109,7 @@ async def process_srt_in_background(task_id: str, input_path: str, voice: str):
                 if os.path.exists(temp_chunk):
                     os.remove(temp_chunk)
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 try:
                     communicate = edge_tts.Communicate(line.text, voice)
                     await communicate.save(temp_chunk)
@@ -120,7 +122,7 @@ async def process_srt_in_background(task_id: str, input_path: str, voice: str):
                 except Exception:
                     pass
             
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
         update_task_status(db, task_id, "processing", "Stitching timeline matching exact SRT timestamps...")
         
@@ -261,13 +263,23 @@ HTML_UI = """
                 <div class="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
                     <div id="progressBar" class="bg-indigo-600 h-2.5 w-0 transition-all duration-500"></div>
                 </div>
-                <a id="downloadBtn" class="hidden block w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition text-center text-sm">Download MP3</a>
+                
+                <div id="actionButtons" class="hidden flex flex-col sm:flex-row gap-2 mt-2">
+                    <audio id="audioPlayer" controls class="w-full mb-1"></audio>
+                    <div class="flex gap-2 w-full">
+                        <button onclick="togglePlay()" id="playBtn" class="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white text-xs py-2 rounded-xl font-medium transition">Play Audio</button>
+                        <a id="downloadBtn" class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs py-2 rounded-xl font-medium transition text-center">Download MP3</a>
+                    </div>
+                </div>
             </div>
         </div>
 
         <!-- Dashboard Page -->
         <div id="dashboardPage" class="hidden w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-4 sm:p-6">
-            <h2 class="text-base sm:text-lg font-bold mb-4">File Processing History</h2>
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-base sm:text-lg font-bold">File History</h2>
+                <button onclick="clearDatabase()" class="bg-rose-600 hover:bg-rose-500 text-white text-xs px-3 py-1.5 rounded-xl transition font-medium">Clear All Data</button>
+            </div>
             <div id="taskList" class="space-y-3 max-h-[60vh] overflow-y-auto pr-1">
                 <p class="text-sm text-slate-500 text-center py-4">Loading tasks...</p>
             </div>
@@ -326,16 +338,30 @@ HTML_UI = """
             }
 
             listEl.innerHTML = tasks.map(t => `
-                <div class="bg-slate-950 border border-slate-800 p-3 sm:p-4 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div class="bg-slate-950 border border-slate-800 p-3 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                     <div class="w-full sm:w-auto overflow-hidden">
                         <p class="text-xs sm:text-sm font-medium text-slate-200 truncate">${t.filename}</p>
-                        <p class="text-[11px] sm:text-xs text-slate-400 mt-0.5">Status: <span class="${t.status === 'completed' ? 'text-emerald-400' : t.status === 'failed' ? 'text-rose-400' : 'text-amber-400'}">${t.status}</span> - ${t.progress}</p>
+                        <p class="text-[11px] text-slate-400 mt-0.5">Status: <span class="${t.status === 'completed' ? 'text-emerald-400' : t.status === 'failed' ? 'text-rose-400' : 'text-amber-400'}">${t.status}</span></p>
                     </div>
-                    <div class="w-full sm:w-auto text-right">
-                        ${t.status === 'completed' ? `<a href="/download/${t.task_id}" class="inline-block w-full sm:w-auto bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-2 rounded-lg font-medium transition text-center">Download</a>` : ''}
+                    <div class="flex gap-2 w-full sm:w-auto justify-end">
+                        ${t.status === 'completed' ? `
+                            <audio id="dashAudio_${t.task_id}" src="/download/${t.task_id}"></audio>
+                            <button onclick="document.getElementById('dashAudio_${t.task_id}').play()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1.5 rounded-lg font-medium transition">Play</button>
+                            <a href="/download/${t.task_id}" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded-lg font-medium transition text-center">Download</a>
+                        ` : ''}
                     </div>
                 </div>
             `).join('');
+        }
+
+        async function clearDatabase() {
+            if(!confirm("Are you sure you want to clear all history and files?")) return;
+            const res = await fetch('/clear-db', { method: 'DELETE' });
+            if(res.ok) {
+                loadDashboardTasks();
+            } else {
+                alert("Failed to clear database.");
+            }
         }
 
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
@@ -344,8 +370,10 @@ HTML_UI = """
             const statusBox = document.getElementById('statusBox');
             const progressText = document.getElementById('progressText');
             const progressBar = document.getElementById('progressBar');
+            const actionButtons = document.getElementById('actionButtons');
             
             statusBox.classList.remove('hidden');
+            actionButtons.classList.add('hidden');
             progressText.textContent = "Uploading & queuing...";
             progressBar.style.width = "10%";
 
@@ -365,10 +393,14 @@ HTML_UI = """
                 if(statusData.status === 'completed') {
                     clearInterval(interval);
                     progressBar.style.width = "100%";
-                    progressText.textContent = "Sync complete!";
+                    progressText.textContent = "Ready!";
+                    
+                    const audioPlayer = document.getElementById('audioPlayer');
+                    audioPlayer.src = `/download/${taskId}`;
+                    
                     const dlBtn = document.getElementById('downloadBtn');
                     dlBtn.href = `/download/${taskId}`;
-                    dlBtn.classList.remove('hidden');
+                    actionButtons.classList.remove('hidden');
                 } else if(statusData.status === 'failed') {
                     clearInterval(interval);
                     progressBar.style.backgroundColor = "#f43f5e";
@@ -385,12 +417,12 @@ HTML_UI = """
             const statusBox = document.getElementById('statusBox');
             const progressText = document.getElementById('progressText');
             const progressBar = document.getElementById('progressBar');
-            const dlBtn = document.getElementById('downloadBtn');
+            const actionButtons = document.getElementById('actionButtons');
             
             statusBox.classList.remove('hidden');
+            actionButtons.classList.add('hidden');
             progressText.textContent = "Generating audio from text...";
             progressBar.style.width = "50%";
-            dlBtn.classList.add('hidden');
 
             const res = await fetch('/convert-text/', { method: 'POST', body: formData });
             const data = await res.json();
@@ -399,9 +431,26 @@ HTML_UI = """
 
             progressBar.style.width = "100%";
             progressText.textContent = "Conversion complete!";
+            
+            const audioPlayer = document.getElementById('audioPlayer');
+            audioPlayer.src = `/download/${data.task_id}`;
+            
+            const dlBtn = document.getElementById('downloadBtn');
             dlBtn.href = `/download/${data.task_id}`;
-            dlBtn.classList.remove('hidden');
+            actionButtons.classList.remove('hidden');
         });
+
+        function togglePlay() {
+            const player = document.getElementById('audioPlayer');
+            const btn = document.getElementById('playBtn');
+            if(player.paused) {
+                player.play();
+                btn.textContent = "Pause Audio";
+            } else {
+                player.pause();
+                btn.textContent = "Play Audio";
+            }
+        }
     </script>
 </body>
 </html>
@@ -483,6 +532,20 @@ def get_tasks():
     tasks = db.query(ConversionTask).order_by(ConversionTask.task_id.desc()).all()
     db.close()
     return [{"task_id": t.task_id, "filename": t.filename, "status": t.status, "progress": t.progress} for t in tasks]
+
+@app.delete("/clear-db")
+def clear_database():
+    db = SessionLocal()
+    try:
+        db.query(SubtitleLine).delete()
+        db.query(ConversionTask).delete()
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 @app.get("/download/{task_id}")
 def download_file(task_id: str):
