@@ -57,21 +57,23 @@ class SubtitleLine(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
-    columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
     
-    migrations = {
-        'filename': "VARCHAR(255)",
-        'mode': "VARCHAR(50) NOT NULL DEFAULT 'srt'",
-        'voice': "VARCHAR(50) NOT NULL DEFAULT 'Swara'",
-        'status': "VARCHAR(50) DEFAULT 'Pending'",
-        'progress_message': "VARCHAR(255) DEFAULT 'Initializing...'",
-        'output_path': "VARCHAR(500)"
-    }
-    
-    with engine.begin() as conn:
-        for col_name, col_type in migrations.items():
-            if col_name not in columns:
-                conn.execute(text(f"ALTER TABLE conversion_tasks ADD COLUMN {col_name} {col_type};"))
+    # Safely auto-migrate missing columns if the table already existed with an older schema
+    if "conversion_tasks" in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
+        migrations = {
+            'filename': "VARCHAR(255)",
+            'mode': "VARCHAR(50) NOT NULL DEFAULT 'srt'",
+            'voice': "VARCHAR(50) NOT NULL DEFAULT 'Swara'",
+            'status': "VARCHAR(50) DEFAULT 'Pending'",
+            'progress_message': "VARCHAR(255) DEFAULT 'Initializing...'",
+            'output_path': "VARCHAR(500)",
+            'created_at': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        }
+        with engine.begin() as conn:
+            for col_name, col_type in migrations.items():
+                if col_name not in columns:
+                    conn.execute(text(f"ALTER TABLE conversion_tasks ADD COLUMN {col_name} {col_type};"))
 
 init_db()
 
@@ -157,110 +159,104 @@ def change_audio_speed(segment: AudioSegment, speed: float) -> AudioSegment:
         return segment
 
 async def process_srt_task(task_id: int):
-    db = SessionLocal()
-    task = db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
-    if not task:
-        db.close()
-        return
+    with SessionLocal() as db:
+        task = db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
+        if not task:
+            return
 
-    try:
-        task.status = "Processing"
-        db.commit()
+        try:
+            task.status = "Processing"
+            db.commit()
 
-        lines = db.query(SubtitleLine).filter(SubtitleLine.task_id == task_id).order_by(SubtitleLine.line_index).all()
-        total_lines = len(lines)
-        
-        if total_lines == 0:
-            raise ValueError("No valid subtitle slots found in file.")
+            lines = db.query(SubtitleLine).filter(SubtitleLine.task_id == task_id).order_by(SubtitleLine.line_index).all()
+            total_lines = len(lines)
+            
+            if total_lines == 0:
+                raise ValueError("No valid subtitle slots found in file.")
 
-        master_track = AudioSegment.silent(duration=0)
-        current_timeline_cursor = 0
+            master_track = AudioSegment.silent(duration=0)
+            current_timeline_cursor = 0
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for idx, line in enumerate(lines, start=1):
-                task.progress_message = f"Generating audio: Line {idx} of {total_lines}"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for idx, line in enumerate(lines, start=1):
+                    task.progress_message = f"Generating audio: Line {idx} of {total_lines}"
+                    db.commit()
+
+                    chunk_path = os.path.join(tmpdir, f"chunk_{idx}.mp3")
+                    success = await generate_speech_chunk(line.text, task.voice, chunk_path)
+                    
+                    if not success or not os.path.exists(chunk_path):
+                        slot_duration = max(500, line.end_ms - line.start_ms)
+                        segment = AudioSegment.silent(duration=slot_duration)
+                    else:
+                        segment = AudioSegment.from_file(chunk_path, format="mp3")
+
+                    target_slot_duration = line.end_ms - line.start_ms
+                    actual_duration = len(segment)
+
+                    if actual_duration > 0 and target_slot_duration > 0:
+                        calculated_speed = actual_duration / target_slot_duration
+                        clamped_speed = max(0.8, min(1.2, calculated_speed))
+                        segment = change_audio_speed(segment, clamped_speed)
+
+                    if line.start_ms > current_timeline_cursor:
+                        gap_duration = line.start_ms - current_timeline_cursor
+                        master_track += AudioSegment.silent(duration=gap_duration)
+                        current_timeline_cursor = line.start_ms
+
+                    master_track += segment
+                    current_timeline_cursor += len(segment)
+
+                task.progress_message = "Stitching timeline matching exact SRT timestamps..."
                 db.commit()
 
-                chunk_path = os.path.join(tmpdir, f"chunk_{idx}.mp3")
-                success = await generate_speech_chunk(line.text, task.voice, chunk_path)
-                
-                if not success or not os.path.exists(chunk_path):
-                    slot_duration = max(500, line.end_ms - line.start_ms)
-                    segment = AudioSegment.silent(duration=slot_duration)
-                else:
-                    segment = AudioSegment.from_file(chunk_path, format="mp3")
+                final_output_filename = f"task_{task_id}_synchronized.mp3"
+                final_output_path = os.path.join(OUTPUT_DIR, final_output_filename)
+                master_track.export(final_output_path, format="mp3")
 
-                target_slot_duration = line.end_ms - line.start_ms
-                actual_duration = len(segment)
+                task.output_path = final_output_path
+                task.status = "Completed"
+                task.progress_message = "Conversion successfully finished!"
+                db.commit()
 
-                if actual_duration > 0 and target_slot_duration > 0:
-                    calculated_speed = actual_duration / target_slot_duration
-                    clamped_speed = max(0.8, min(1.2, calculated_speed))
-                    segment = change_audio_speed(segment, clamped_speed)
-
-                if line.start_ms > current_timeline_cursor:
-                    gap_duration = line.start_ms - current_timeline_cursor
-                    master_track += AudioSegment.silent(duration=gap_duration)
-                    current_timeline_cursor = line.start_ms
-
-                master_track += segment
-                current_timeline_cursor += len(segment)
-
-            task.progress_message = "Stitching timeline matching exact SRT timestamps..."
+        except Exception as e:
+            task.status = "Failed"
+            task.progress_message = f"Error: {str(e)}"
             db.commit()
-
-            final_output_filename = f"task_{task_id}_synchronized.mp3"
-            final_output_path = os.path.join(OUTPUT_DIR, final_output_filename)
-            master_track.export(final_output_path, format="mp3")
-
-            task.output_path = final_output_path
-            task.status = "Completed"
-            task.progress_message = "Conversion successfully finished!"
-            db.commit()
-
-    except Exception as e:
-        task.status = "Failed"
-        task.progress_message = f"Error: {str(e)}"
-        db.commit()
-    finally:
-        db.close()
 
 async def process_text_task(task_id: int, raw_text: str):
-    db = SessionLocal()
-    task = db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
-    if not task:
-        db.close()
-        return
+    with SessionLocal() as db:
+        task = db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
+        if not task:
+            return
 
-    try:
-        task.status = "Processing"
-        task.progress_message = "Generating direct neural audio..."
-        db.commit()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            chunk_path = os.path.join(tmpdir, "text_output.mp3")
-            success = await generate_speech_chunk(raw_text, task.voice, chunk_path)
-            
-            if not success:
-                raise Exception("Failed to generate neural speech audio from text.")
-
-            final_output_filename = f"task_{task_id}_direct.mp3"
-            final_output_path = os.path.join(OUTPUT_DIR, final_output_filename)
-            
-            segment = AudioSegment.from_file(chunk_path, format="mp3")
-            segment.export(final_output_path, format="mp3")
-
-            task.output_path = final_output_path
-            task.status = "Completed"
-            task.progress_message = "Instant text conversion completed!"
+        try:
+            task.status = "Processing"
+            task.progress_message = "Generating direct neural audio..."
             db.commit()
 
-    except Exception as e:
-        task.status = "Failed"
-        task.progress_message = f"Error: {str(e)}"
-        db.commit()
-    finally:
-        db.close()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                chunk_path = os.path.join(tmpdir, "text_output.mp3")
+                success = await generate_speech_chunk(raw_text, task.voice, chunk_path)
+                
+                if not success:
+                    raise Exception("Failed to generate neural speech audio from text.")
+
+                final_output_filename = f"task_{task_id}_direct.mp3"
+                final_output_path = os.path.join(OUTPUT_DIR, final_output_filename)
+                
+                segment = AudioSegment.from_file(chunk_path, format="mp3")
+                segment.export(final_output_path, format="mp3")
+
+                task.output_path = final_output_path
+                task.status = "Completed"
+                task.progress_message = "Instant text conversion completed!"
+                db.commit()
+
+        except Exception as e:
+            task.status = "Failed"
+            task.progress_message = f"Error: {str(e)}"
+            db.commit()
 
 # ==========================================
 # API ENDPOINTS
@@ -362,7 +358,7 @@ async def get_all_tasks(db: Session = Depends(get_db)):
             "voice": t.voice,
             "status": t.status,
             "progress_message": t.progress_message,
-            "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
             "has_output": bool(t.output_path and os.path.exists(t.output_path))
         })
     return results
@@ -586,7 +582,6 @@ HTML_TEMPLATE = """
 
         async function handleSubmission(event) {
             event.preventDefault();
-            const formElement = document.getElementById('conversion-form');
             const voice = document.getElementById('voice-select').value;
 
             let endpoint = '/convert/';
@@ -628,7 +623,7 @@ HTML_TEMPLATE = """
                 try {
                     data = JSON.parse(responseText);
                 } catch (e) {
-                    throw new Error("Server response was not valid JSON. Response: " + responseText.substring(0, 100));
+                    throw new Error("Server response: " + responseText);
                 }
 
                 if (!response.ok) throw new Error(data.detail || 'Failed to start conversion task.');
