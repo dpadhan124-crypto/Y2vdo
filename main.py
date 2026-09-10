@@ -32,9 +32,9 @@ class ConversionTask(Base):
     __tablename__ = "conversion_tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    mode = Column(String(50), nullable=False)  # 'srt' or 'text'
+    mode = Column(String(50), nullable=False, default="srt")  # 'srt' or 'text'
     filename = Column(String(255), nullable=True)
-    voice = Column(String(50), nullable=False)
+    voice = Column(String(50), nullable=False, default="Swara")
     status = Column(String(50), default="Pending")  # Pending, Processing, Completed, Failed
     progress_message = Column(String(255), default="Initializing...")
     output_path = Column(String(500), nullable=True)
@@ -58,9 +58,20 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
     columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
-    if 'filename' not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE conversion_tasks ADD COLUMN filename VARCHAR(255);"))
+    
+    migrations = {
+        'filename': "VARCHAR(255)",
+        'mode': "VARCHAR(50) NOT NULL DEFAULT 'srt'",
+        'voice': "VARCHAR(50) NOT NULL DEFAULT 'Swara'",
+        'status': "VARCHAR(50) DEFAULT 'Pending'",
+        'progress_message': "VARCHAR(255) DEFAULT 'Initializing...'",
+        'output_path': "VARCHAR(500)"
+    }
+    
+    with engine.begin() as conn:
+        for col_name, col_type in migrations.items():
+            if col_name not in columns:
+                conn.execute(text(f"ALTER TABLE conversion_tasks ADD COLUMN {col_name} {col_type};"))
 
 init_db()
 
@@ -576,7 +587,6 @@ HTML_TEMPLATE = """
         async function handleSubmission(event) {
             event.preventDefault();
             const formElement = document.getElementById('conversion-form');
-            const formData = new FormData(formElement);
             const voice = document.getElementById('voice-select').value;
 
             let endpoint = '/convert/';
@@ -612,7 +622,15 @@ HTML_TEMPLATE = """
                     method: 'POST',
                     body: submitPayload
                 });
-                const data = await response.json();
+                
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch (e) {
+                    throw new Error("Server response was not valid JSON. Response: " + responseText.substring(0, 100));
+                }
+
                 if (!response.ok) throw new Error(data.detail || 'Failed to start conversion task.');
 
                 document.getElementById('task-id-badge').innerText = "Task #" + data.task_id;
