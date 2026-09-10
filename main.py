@@ -6,12 +6,11 @@ from fastapi.responses import HTMLResponse, FileResponse
 import pysrt
 from gtts import gTTS
 from pydub import AudioSegment
-from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy import create_engine, Column, String, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# --- DATABASE SETUP (Supabase / Neon Free Postgres URL) ---
-# Replace with your free PostgreSQL connection string from Supabase or Neon
+# --- DATABASE SETUP ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@host:port/dbname")
 
 engine = create_engine(DATABASE_URL)
@@ -23,17 +22,16 @@ class ConversionTask(Base):
     task_id = Column(String, primary_key=True, index=True)
     status = Column(String, default="processing") # processing, completed, failed
     progress = Column(String, default="0/0 parts")
-    download_path = Column(String, nullable=True)
+    merged_audio_data = Column(LargeBinary, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Large SRT to Hindi MP3 Converter")
 
-# --- BACKGROUND PROCESSOR ---
+# --- BACKGROUND PROCESSOR (Database Blob Storage / Zero RAM Saturation) ---
 def process_srt_in_background(task_id: str, input_path: str):
     db = SessionLocal()
     chunks_dir = f"chunks_{task_id}"
-    output_mp3_path = f"output_{task_id}.mp3"
     
     try:
         os.makedirs(chunks_dir, exist_ok=True)
@@ -58,7 +56,6 @@ def process_srt_in_background(task_id: str, input_path: str):
             current_cluster.append(sub.text.replace('\n', ' ').strip())
             cluster_duration_ms += max(sub_duration, 1000)
             
-            # If cluster reaches ~2 minutes (120,000 ms), push and reset
             if cluster_duration_ms >= 120000:
                 clusters.append(" ".join(current_cluster))
                 current_cluster = []
@@ -84,18 +81,29 @@ def process_srt_in_background(task_id: str, input_path: str):
             segment = AudioSegment.from_mp3(chunk_path)
             combined_audio += segment + silence
             
-            # Brief pause to prevent hitting Google TTS rate limits (HTTP 429)
+            # Delete individual chunk immediately after adding to save disk space
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+                
             time.sleep(1)
 
-        combined_audio.export(output_mp3_path, format="mp3")
+        # Export final merged file locally temporarily to read binary blob bytes
+        temp_output_path = f"merged_{task_id}.mp3"
+        combined_audio.export(temp_output_path, format="mp3")
         
-        # Mark complete
+        with open(temp_output_path, "rb") as f:
+            audio_binary_data = f.read()
+
+        # Save merged binary data to database, then clear all local processing cache
         task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
         if task:
             task.status = "completed"
             task.progress = f"Completed {total_parts} parts"
-            task.download_path = output_mp3_path
+            task.merged_audio_data = audio_binary_data
             db.commit()
+
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
 
     except Exception as e:
         update_task(db, task_id, status="failed", progress=str(e))
@@ -126,11 +134,11 @@ HTML_UI = """
 <body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
         <h1 class="text-2xl font-bold text-center mb-2">Large SRT to Hindi Audio</h1>
-        <p class="text-xs text-slate-400 text-center mb-6">Splits file into 2-minute parts, processes securely via DB background queue.</p>
+        <p class="text-xs text-slate-400 text-center mb-6">Zero RAM overload: Chunked processing stored directly into database blobs.</p>
         
         <form id="uploadForm" class="space-y-4">
             <input type="file" id="srtFile" name="file" accept=".srt" required class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer"/>
-            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Chunk Processing</button>
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-xl transition">Start Processing</button>
         </form>
 
         <div id="statusBox" class="hidden mt-6 space-y-3 text-center border-t border-slate-800 pt-4">
@@ -147,7 +155,7 @@ HTML_UI = """
             const progressText = document.getElementById('progressText');
             
             statusBox.classList.remove('hidden');
-            progressText.textContent = "Uploading & setting up database task...";
+            progressText.textContent = "Uploading & setting up task...";
 
             const res = await fetch('/convert/', { method: 'POST', body: formData });
             const data = await res.json();
@@ -156,7 +164,6 @@ HTML_UI = """
 
             const taskId = data.task_id;
             
-            // Poll status every 3 seconds
             const interval = setInterval(async () => {
                 const statusRes = await fetch(`/status/${taskId}`);
                 const statusData = await statusRes.json();
@@ -181,8 +188,8 @@ HTML_UI = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-py_root = lambda: HTMLResponse(content=HTML_UI)
-app.add_api_route("/", py_root, methods=["GET"])
+def read_root():
+    return HTMLResponse(content=HTML_UI)
 
 @app.post("/convert/")
 async def convert_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -219,6 +226,12 @@ def download_file(task_id: str):
     db = SessionLocal()
     task = db.query(ConversionTask).filter(ConversionTask.task_id == task_id).first()
     db.close()
-    if not task or not task.download_path or not os.path.exists(task.download_path):
+    
+    if not task or not task.merged_audio_data:
         raise HTTPException(status_code=404, detail="File not ready or missing.")
-    return FileResponse(task.download_path, media_type="audio/mpeg", filename="hindi_full_audio.mp3")
+    
+    output_filename = f"merged_output_{task_id}.mp3"
+    with open(output_filename, "wb") as f:
+        f.write(task.merged_audio_data)
+        
+    return FileResponse(output_filename, media_type="audio/mpeg", filename="hindi_full_audio.mp3")
