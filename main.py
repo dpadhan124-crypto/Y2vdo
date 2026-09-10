@@ -55,25 +55,17 @@ class SubtitleLine(Base):
     task = relationship("ConversionTask", back_populates="lines")
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
-    inspector = inspect(engine)
+    try:
+        inspector = inspect(engine)
+        # If tables exist but have a broken schema (e.g. missing primary key or id), drop them to force clean creation
+        if "conversion_tasks" in inspector.get_table_names():
+            columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
+            if 'id' not in columns:
+                Base.metadata.drop_all(bind=engine)
+    except Exception:
+        pass
     
-    # Safely auto-migrate missing columns if the table already existed with an older schema
-    if "conversion_tasks" in inspector.get_table_names():
-        columns = [col['name'] for col in inspector.get_columns('conversion_tasks')]
-        migrations = {
-            'filename': "VARCHAR(255)",
-            'mode': "VARCHAR(50) NOT NULL DEFAULT 'srt'",
-            'voice': "VARCHAR(50) NOT NULL DEFAULT 'Swara'",
-            'status': "VARCHAR(50) DEFAULT 'Pending'",
-            'progress_message': "VARCHAR(255) DEFAULT 'Initializing...'",
-            'output_path': "VARCHAR(500)",
-            'created_at': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-        }
-        with engine.begin() as conn:
-            for col_name, col_type in migrations.items():
-                if col_name not in columns:
-                    conn.execute(text(f"ALTER TABLE conversion_tasks ADD COLUMN {col_name} {col_type};"))
+    Base.metadata.create_all(bind=engine)
 
 init_db()
 
